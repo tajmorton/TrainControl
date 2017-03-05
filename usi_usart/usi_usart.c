@@ -2,7 +2,7 @@
 #include <avr/interrupt.h>
 
 #define F_CPU 1000000  // 1 MHz
-#define BAUD 9600
+#define BAUD 4800
 #define CYCLES_PER_BIT (F_CPU/BAUD)
 
 #if (CYCLES_PER_BIT > 255)
@@ -17,7 +17,7 @@
 #define FULL_BIT_TICKS (CYCLES_PER_BIT/DIVISOR)
 #define HALF_BIT_TICKS (FULL_BIT_TICKS/2)
 
-#define SETUP_TIME (65 + 42) // number of cycles required to setup for read after setting start bit
+#define SETUP_TIME (62) // number of cycles required to setup for read after seeing start bit
 #define TIMER_START_DELAY (SETUP_TIME/DIVISOR) // value to count to while waiting for the above
 
 #define PIN(x) (1 << x)
@@ -26,6 +26,7 @@
 #include <util/delay.h>
 volatile uint8_t serialDataReady = 0;
 volatile uint8_t serialInput;
+volatile uint8_t bitCount = 0;
 
 void setupRead(void);
 void sawStartBit(void);
@@ -38,16 +39,16 @@ uint8_t ReverseByte (uint8_t x) {
 }
 
 ISR(BADISR_vect) {
-    PORTB |= PIN(1);
+    PORTB &= ~PIN(0);
 }
 
 ISR(PCINT1_vect) {
     /*
      * ISR that is triggered by the start bit on PB4.
      */
-    PORTB |= PIN(0);
     if (!(PINB & PIN(4))) {
         // falling edge on PB4
+        PORTB |= PIN(1);
         sawStartBit();
     }
 }
@@ -78,11 +79,14 @@ void sawStartBit(void) {
     GTCCR |= 1<<PSR10; // reset prescaler
     TCNT0 = 0; // initialize timer
 
+    bitCount = 0;
     // wait until middle of start bit
-    OCR0A = HALF_BIT_TICKS - TIMER_START_DELAY;
+    //OCR0A = HALF_BIT_TICKS - TIMER_START_DELAY;
+    OCR0A = 254;
 
     TIFR0 = 1<<OCF0A; // clear output compare interrupt on OCR0A
     TIMSK0 |= 1<<OCIE0A; // enable interrupt on compare of OCR0A
+    PORTB &= ~PIN(1);
 }
 
 ISR(TIM0_COMPA_vect) {
@@ -96,6 +100,27 @@ ISR(TIM0_COMPA_vect) {
     TCNT0 = 0; // re-initialize timer
     OCR0A = FULL_BIT_TICKS;
 
+    // i am a syntax error because:
+    // TODO: THIS INTERRUPT IS GETTING CALLED REPEATEDLY,
+    // NOT JUST ONCE
+    PORTB ^= PIN(1);
+
+    /*
+    if (bitCount > 7) {
+        TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
+        GIFR = 1<<PCIF1;
+
+        // re-enable pin change interrupts so we can read the next byte
+        GIMSK |= 1<<PCIE1;
+
+        PORTB &= ~PIN(1);
+    }
+    else {
+        bitCount++;
+    }
+    return;
+    */
+
     USICR = (
         1<<USICS0 | // clock in on TC0 compare match
         0<<USIWM0 | // all hardware wire modes disabled
@@ -103,6 +128,7 @@ ISR(TIM0_COMPA_vect) {
     );
 
     USISR = (
+        //1<<USIOIF | // clear USI overflow interrupt flag
         1<<USISIF | // clear read-bit flag
         8<<USICNT0  // generate USI overflow interrupt after reading 8 bits
     );
@@ -112,8 +138,11 @@ ISR(USI_OVF_vect) {
     /*
      * Interrupt fired once we have read 8 bits.
      */
+    TCCR0B = 0;
     serialInput = USIDR;
     serialDataReady = 1;
+
+    PORTB &= ~PIN(1);
 
     USICR = 0; // disable USI now that we've read the whole byte in
 
@@ -129,7 +158,7 @@ int main(void) {
     uint8_t serData;
 
     DDRB |= PIN(0) | PIN(1);
-    PORTB = 0;
+    PORTB = 1;
     setupRead();
     sei();
 
@@ -156,22 +185,23 @@ int main(void) {
             serData = ReverseByte(serialInput);
             serialDataReady = 0;
 
-            if (serData == '0') {
+            if (serData == 0x00) {
                 PORTB &= ~PIN(0);
             }
-            else if (serData == '1') {
+            else if (serData == 0x01) {
                 PORTB |= PIN(0);
             }
             else {
                 PORTB |= PIN(0);
-                _delay_ms(100);
+                _delay_ms(200);
                 PORTB &= ~PIN(0);
-                _delay_ms(100);
+                _delay_ms(200);
 
                 PORTB |= PIN(0);
-                _delay_ms(100);
+                _delay_ms(200);
                 PORTB &= ~PIN(0);
-                _delay_ms(100);
+                _delay_ms(200);
+                PORTB &= ~PIN(1);
             }
         }
     }
