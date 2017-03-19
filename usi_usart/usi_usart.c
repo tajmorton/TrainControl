@@ -26,7 +26,6 @@
 #include <util/delay.h>
 volatile uint8_t serialDataReady = 0;
 volatile uint8_t serialInput;
-volatile uint8_t bitCount = 0;
 
 void setupRead(void);
 void sawStartBit(void);
@@ -36,6 +35,15 @@ uint8_t ReverseByte (uint8_t x) {
     x = ((x >> 2) & 0x33) | ((x << 2) & 0xcc);
     x = ((x >> 4) & 0x0f) | ((x << 4) & 0xf0);
     return x;
+
+    /*
+    uint8_t tmp = 0;
+    uint8_t i = 0;
+    for (i=0; i < 8; i++) {
+        tmp = (x>>tmp & 0x01) << (8-i);
+    }
+    return tmp;
+    */
 }
 
 ISR(BADISR_vect) {
@@ -79,14 +87,26 @@ void sawStartBit(void) {
     GTCCR |= 1<<PSR10; // reset prescaler
     TCNT0 = 0; // initialize timer
 
-    bitCount = 0;
     // wait until middle of start bit
     //OCR0A = HALF_BIT_TICKS - TIMER_START_DELAY;
-    OCR0A = 254;
+    //OCR0A = 200;
+    OCR0A = FULL_BIT_TICKS;
 
     TIFR0 = 1<<OCF0A; // clear output compare interrupt on OCR0A
     TIMSK0 |= 1<<OCIE0A; // enable interrupt on compare of OCR0A
     PORTB &= ~PIN(1);
+
+    USICR = (
+        1<<USICS0 | // clock in on TC0 compare match
+        0<<USIWM0 | // all hardware wire modes disabled
+        1<<USIOIE   // generate interrupt when reading a bit (so we can count to 8)
+    );
+
+    USISR = (
+        1<<USIOIF | // clear USI overflow interrupt flag
+        1<<USISIF | // clear read-bit flag
+        8<<USICNT0  // generate USI overflow interrupt after reading 8 bits
+    );
 }
 
 ISR(TIM0_COMPA_vect) {
@@ -95,10 +115,12 @@ ISR(TIM0_COMPA_vect) {
      * Used to configure timer to read once per bit and to enable
      * the USI.
      */
-    TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
+    //TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
 
     TCNT0 = 0; // re-initialize timer
+    /*
     OCR0A = FULL_BIT_TICKS;
+    */
 
     // i am a syntax error because:
     // TODO: THIS INTERRUPT IS GETTING CALLED REPEATEDLY,
@@ -121,17 +143,24 @@ ISR(TIM0_COMPA_vect) {
     return;
     */
 
-    USICR = (
-        1<<USICS0 | // clock in on TC0 compare match
-        0<<USIWM0 | // all hardware wire modes disabled
-        1<<USIOIE   // generate interrupt when reading a bit (so we can count to 8)
-    );
+    /*
+    if (!(USICR & 1<<USICS0)) {
+        USICR = (
+            1<<USICS0 | // clock in on TC0 compare match
+            0<<USIWM0 | // all hardware wire modes disabled
+            1<<USIOIE   // generate interrupt when reading a bit (so we can count to 8)
+        );
 
-    USISR = (
-        //1<<USIOIF | // clear USI overflow interrupt flag
-        1<<USISIF | // clear read-bit flag
-        8<<USICNT0  // generate USI overflow interrupt after reading 8 bits
-    );
+        USISR = (
+            1<<USIOIF | // clear USI overflow interrupt flag
+            1<<USISIF | // clear read-bit flag
+            8<<USICNT0  // generate USI overflow interrupt after reading 8 bits
+        );
+    }
+    else {
+        TIMSK0 |= (1<<OCIE0A);
+    }
+    */
 }
 
 ISR(USI_OVF_vect) {
@@ -152,10 +181,26 @@ ISR(USI_OVF_vect) {
 
     // re-enable pin change interrupts so we can read the next byte
     GIMSK |= 1<<PCIE1;
+
+    TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
+
+    /*
+    _delay_us(10);
+    char i = 0;
+    for (i = 0; i < 8; i++) {
+        if (serialInput>>i & 1) {
+            PORTB |= PIN(1);
+        }
+        else {
+            PORTB &= ~PIN(1);
+        }
+        _delay_us(10);
+    }
+    */
 }
 
 int main(void) {
-    uint8_t serData;
+    uint8_t serData = 0;
 
     DDRB |= PIN(0) | PIN(1);
     PORTB = 1;
@@ -185,11 +230,13 @@ int main(void) {
             serData = ReverseByte(serialInput);
             serialDataReady = 0;
 
-            if (serData == 0x00) {
-                PORTB &= ~PIN(0);
-            }
-            else if (serData == 0x01) {
+            //if (serData & 0x07) {
+            if (serData == 0xAA) {
                 PORTB |= PIN(0);
+            }
+            //else if (!(serData & 0x07)) {
+            else if (serData == 0x55) {
+                PORTB &= ~PIN(0);
             }
             else {
                 PORTB |= PIN(0);
