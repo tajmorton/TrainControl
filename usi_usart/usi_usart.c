@@ -14,7 +14,7 @@
 #define PRESCALE 1  // CLK[io]/1
 #endif
 
-#define FULL_BIT_TICKS (CYCLES_PER_BIT/DIVISOR)
+#define FULL_BIT_TICKS ((CYCLES_PER_BIT/DIVISOR) + 10)
 #define HALF_BIT_TICKS (FULL_BIT_TICKS/2)
 
 #define SETUP_TIME (62) // number of cycles required to setup for read after seeing start bit
@@ -35,30 +35,10 @@ uint8_t ReverseByte (uint8_t x) {
     x = ((x >> 2) & 0x33) | ((x << 2) & 0xcc);
     x = ((x >> 4) & 0x0f) | ((x << 4) & 0xf0);
     return x;
-
-    /*
-    uint8_t tmp = 0;
-    uint8_t i = 0;
-    for (i=0; i < 8; i++) {
-        tmp = (x>>tmp & 0x01) << (8-i);
-    }
-    return tmp;
-    */
 }
 
 ISR(BADISR_vect) {
     PORTB &= ~PIN(0);
-}
-
-ISR(PCINT1_vect) {
-    /*
-     * ISR that is triggered by the start bit on PB4.
-     */
-    if (!(PINB & PIN(4))) {
-        // falling edge on PB4
-        PORTB |= PIN(1);
-        sawStartBit();
-    }
 }
 
 void setupRead(void) {
@@ -71,6 +51,17 @@ void setupRead(void) {
 
     GIMSK |= 1<<PCIE1; // enable PCIE1 interrupts, so we can get interrupt on PCINT12/PB4
     PCMSK1 |= 1<<PCINT12; // enable interrupt from PCINT12/PB4
+}
+
+ISR(PCINT1_vect) {
+    /*
+     * ISR that is triggered by the start bit on PB4.
+     */
+    if (!(PINB & PIN(4))) {
+        // falling edge on PB4
+        PORTB |= PIN(1);
+        sawStartBit();
+    }
 }
 
 void sawStartBit(void) {
@@ -87,15 +78,20 @@ void sawStartBit(void) {
     GTCCR |= 1<<PSR10; // reset prescaler
     TCNT0 = 0; // initialize timer
 
-    // wait until middle of start bit
-    //OCR0A = HALF_BIT_TICKS - TIMER_START_DELAY;
-    //OCR0A = 200;
+    // Configured at 4800 baud @ 1 MHz, we are at approximately halfway
+    // through the start bit by the time this line is hit.
+    // Start the FULL_BIT_TICKS so that the first time the timer triggers,
+    // we are ~halfway through the first bit to be read.
     OCR0A = FULL_BIT_TICKS;
 
+    // turn on output compare interrupt, this is just so we can
+    // toggle an output pin and see how accurately we're hitting the
+    // middle of the bit
     TIFR0 = 1<<OCF0A; // clear output compare interrupt on OCR0A
     TIMSK0 |= 1<<OCIE0A; // enable interrupt on compare of OCR0A
     PORTB &= ~PIN(1);
 
+    // configure USI hardware
     USICR = (
         1<<USICS0 | // clock in on TC0 compare match
         0<<USIWM0 | // all hardware wire modes disabled
@@ -112,91 +108,35 @@ void sawStartBit(void) {
 ISR(TIM0_COMPA_vect) {
     /*
      * Interrupt fired once we are at the middle of the start bit.
-     * Used to configure timer to read once per bit and to enable
-     * the USI.
+     * Should be used to configure timer to read once per bit and
+     * to enable the USI.
+     * Currently just toggles a bit so we can measure how accurately
+     * we're hitting the middle of the bit.
      */
-    //TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
-
-    TCNT0 = 0; // re-initialize timer
-    /*
-    OCR0A = FULL_BIT_TICKS;
-    */
-
-    // i am a syntax error because:
-    // TODO: THIS INTERRUPT IS GETTING CALLED REPEATEDLY,
-    // NOT JUST ONCE
     PORTB ^= PIN(1);
-
-    /*
-    if (bitCount > 7) {
-        TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
-        GIFR = 1<<PCIF1;
-
-        // re-enable pin change interrupts so we can read the next byte
-        GIMSK |= 1<<PCIE1;
-
-        PORTB &= ~PIN(1);
-    }
-    else {
-        bitCount++;
-    }
-    return;
-    */
-
-    /*
-    if (!(USICR & 1<<USICS0)) {
-        USICR = (
-            1<<USICS0 | // clock in on TC0 compare match
-            0<<USIWM0 | // all hardware wire modes disabled
-            1<<USIOIE   // generate interrupt when reading a bit (so we can count to 8)
-        );
-
-        USISR = (
-            1<<USIOIF | // clear USI overflow interrupt flag
-            1<<USISIF | // clear read-bit flag
-            8<<USICNT0  // generate USI overflow interrupt after reading 8 bits
-        );
-    }
-    else {
-        TIMSK0 |= (1<<OCIE0A);
-    }
-    */
 }
 
 ISR(USI_OVF_vect) {
     /*
      * Interrupt fired once we have read 8 bits.
      */
-    TCCR0B = 0;
-    serialInput = USIDR;
+
+    TCCR0B = 0;  // turn off timer
+    serialInput = USIDR; // read input data
     serialDataReady = 1;
 
     PORTB &= ~PIN(1);
 
     USICR = 0; // disable USI now that we've read the whole byte in
 
-    // clear interrupt flag on PCIE1, because it will have triggered while reading in data
-    // (and we re-enable it on the next line)
+    // clear interrupt flag on PCIE1 that it will have triggered while
+    // reading in data (to prevent it from triggering an interrupt
+    // when we re-enable it on the next line)
     GIFR = 1<<PCIF1;
 
     // re-enable pin change interrupts so we can read the next byte
+    // (when it arrives)
     GIMSK |= 1<<PCIE1;
-
-    TIMSK0 &= ~(1<<OCIE0A); // disable this interrupt now to prevent this ISR from being called for the next bit
-
-    /*
-    _delay_us(10);
-    char i = 0;
-    for (i = 0; i < 8; i++) {
-        if (serialInput>>i & 1) {
-            PORTB |= PIN(1);
-        }
-        else {
-            PORTB &= ~PIN(1);
-        }
-        _delay_us(10);
-    }
-    */
 }
 
 int main(void) {
@@ -210,31 +150,13 @@ int main(void) {
     uint8_t i = 0;
 
     while(1) {
-        /*
-        PORTB |= PIN(0);
-        i=0;
-        while (i<10) {
-            _delay_ms(100);
-            i++;
-        }
-        PORTB &= ~PIN(0);
-        i=0;
-        while (i<10) {
-            _delay_ms(100);
-            i++;
-        }
-        continue;
-        */
-
         if (serialDataReady) {
             serData = ReverseByte(serialInput);
             serialDataReady = 0;
 
-            //if (serData & 0x07) {
             if (serData == 0xAA) {
                 PORTB |= PIN(0);
             }
-            //else if (!(serData & 0x07)) {
             else if (serData == 0x55) {
                 PORTB &= ~PIN(0);
             }
